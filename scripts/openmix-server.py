@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """
-OpenMix Server — Stage 1: Cleartext Bootstrap
+OpenMix Server — MITM passthrough with selective hijack.
 
-Impersonates Vorwerk's infrastructure bootstrap endpoints that the TM6
-hits over plaintext HTTP during boot. This is the first step in getting
-the TM6 to trust our server.
+Sits between the TM6 and Vorwerk's real servers. By default, every request
+is proxied to the real Vorwerk server via the USB Ethernet internet connection
+and the full request+response is logged. Specific endpoints can be hijacked
+to serve our own responses instead.
 
-Endpoints served:
-  GET /.well-known/device-infra-home       → 307 redirect
-  GET /.well-known/infrastructure-home     → HAL+JSON with EST/time URLs
-  GET /time?challenge=<base64>             → PKCS#7 signed time response
+The Docker container resolves DNS normally (via systemd-resolved on the host),
+so it reaches real Vorwerk servers. The TM6 can't — its DNS is spoofed by
+dnsmasq on the AP interface to point at us.
+
+Modes:
+  --mode passthrough   Proxy everything to Vorwerk, log all traffic (default)
+  --mode hijack        Serve our own bootstrap responses, proxy the rest
 
 Usage:
-  python3 openmix-server.py [--port 80] [--host 0.0.0.0]
+  python3 openmix-server.py [--mode passthrough] [--port 80]
 """
 
 import argparse
-import base64
 import json
 import logging
 import os
-import time
+import time as time_mod
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+import http.client
+import ssl
 
 # Optional: cryptography for PKCS#7 time signing
 try:
@@ -44,33 +49,20 @@ log = logging.getLogger("openmix")
 
 # --- Configuration ---
 
-# The server's own address — used to build self-referencing URLs.
-# In production this is the AP gateway IP (e.g. 192.168.50.1).
 SERVER_HOST = os.environ.get("OPENMIX_HOST", "192.168.50.1")
 SERVER_PORT = int(os.environ.get("OPENMIX_PORT", "80"))
-
-# Locale prefix — the TM6 uses a 2-letter country code.
-# The PCAP shows "es" (Spain). Adjust for your locale.
 LOCALE = os.environ.get("OPENMIX_LOCALE", "es")
-
-# EST RA — where we'll point the device for certificate enrollment.
-# For now, point to ourselves. Stage 2 will implement actual EST.
 EST_HOST = os.environ.get("OPENMIX_EST_HOST", SERVER_HOST)
 EST_PORT = int(os.environ.get("OPENMIX_EST_PORT", "8443"))
-
-# CA key/cert paths (generated on first run if missing)
 CA_DIR = os.environ.get("OPENMIX_CA_DIR", "/openmix/data/ca")
+LOG_DIR = os.environ.get("OPENMIX_LOG_DIR", "/openmix/data/captures")
+
+# How long to wait for Vorwerk to respond (seconds)
+PROXY_TIMEOUT = 30
 
 
 def get_infrastructure_home():
-    """
-    Build the HAL+JSON infrastructure-home response.
-
-    This is what Vorwerk's server returns at:
-      http://es.plain.production-eu.cookidoo.vorwerk-digital.com/.well-known/infrastructure-home
-
-    We modify it to point EST and time endpoints to our own server.
-    """
+    """Build the modified HAL+JSON that points EST/time to our server."""
     base_http = f"http://{SERVER_HOST}:{SERVER_PORT}" if SERVER_PORT != 80 else f"http://{SERVER_HOST}"
     est_base = f"https://{EST_HOST}:{EST_PORT}" if EST_PORT != 443 else f"https://{EST_HOST}"
 
@@ -105,10 +97,7 @@ def get_infrastructure_home():
 
 
 class OpenMixCA:
-    """
-    Minimal CA for signing time responses and (later) issuing device certs.
-    Generates a self-signed root CA on first use.
-    """
+    """Minimal CA for signing time responses and (later) issuing device certs."""
 
     def __init__(self, ca_dir):
         self.ca_dir = ca_dir
@@ -165,21 +154,10 @@ class OpenMixCA:
             log.info("CA generated: %s", self.ca_cert.subject)
 
     def sign_time_response(self, challenge_b64):
-        """
-        Create a PKCS#7 SignedData containing the current time,
-        signed with our CA key. This mimics Vorwerk's /time endpoint.
-
-        The actual format from Vorwerk is a CMS SignedData (application/pkcs7-mime).
-        We replicate that structure so the TM6 can verify it.
-        """
+        """Create a PKCS#7 SignedData containing the current time."""
         if not HAS_CRYPTO:
-            log.warning("cryptography not installed — returning unsigned time")
             return None
 
-        # The time payload — we don't know the exact format Vorwerk uses
-        # inside the PKCS#7 envelope, but it likely includes:
-        # - The current UTC time
-        # - The challenge nonce (to prevent replay)
         now = datetime.now(timezone.utc)
         time_payload = json.dumps({
             "utc": now.isoformat(),
@@ -187,7 +165,6 @@ class OpenMixCA:
             "challenge": challenge_b64,
         }).encode("utf-8")
 
-        # Build PKCS#7 SignedData
         signed = (
             pkcs7.PKCS7SignatureBuilder()
             .set_data(time_payload)
@@ -197,158 +174,323 @@ class OpenMixCA:
         return signed
 
 
-class OpenMixHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the OpenMix bootstrap server."""
+class CaptureLogger:
+    """
+    Logs full HTTP request/response pairs to disk for later analysis.
+    Each capture is a JSON file with request + response details.
+    """
 
-    server_version = "nginx/1.19.1"  # Mimic Vorwerk's server header
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.seq = 0
+
+    def log_exchange(self, request_data, response_data, source):
+        """
+        Log a complete HTTP exchange.
+        source: 'proxied' (from real Vorwerk) or 'hijacked' (our response)
+        """
+        self.seq += 1
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"{ts}_{self.seq:04d}_{source}.json"
+        filepath = os.path.join(self.log_dir, filename)
+
+        # Don't write binary body inline — save separately if large
+        resp_body = response_data.get("body", b"")
+        resp_content_type = response_data.get("content_type", "")
+
+        if isinstance(resp_body, bytes):
+            if len(resp_body) > 10000 or not resp_content_type.startswith(("text/", "application/json", "application/hal")):
+                # Save binary body as separate file
+                body_file = filepath.replace(".json", ".body")
+                with open(body_file, "wb") as f:
+                    f.write(resp_body)
+                response_data = {**response_data, "body": f"<binary {len(resp_body)} bytes, see {os.path.basename(body_file)}>"}
+            else:
+                try:
+                    response_data = {**response_data, "body": resp_body.decode("utf-8")}
+                except UnicodeDecodeError:
+                    body_file = filepath.replace(".json", ".body")
+                    with open(body_file, "wb") as f:
+                        f.write(resp_body)
+                    response_data = {**response_data, "body": f"<binary {len(resp_body)} bytes, see {os.path.basename(body_file)}>"}
+
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "request": request_data,
+            "response": response_data,
+        }
+
+        with open(filepath, "w") as f:
+            json.dump(record, f, indent=2, default=str)
+
+        log.info("Captured → %s", filename)
+
+
+class OpenMixHandler(BaseHTTPRequestHandler):
+    """HTTP request handler with proxy passthrough."""
+
+    server_version = "nginx/1.19.1"
 
     def log_message(self, format, *args):
-        log.info(
-            "%s %s",
-            self.address_string(),
-            format % args,
-        )
+        # Suppress default logging — we do our own
+        pass
 
-    def do_GET(self):
+    def _get_request_data(self):
+        """Capture the incoming request details."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+        return {
+            "method": self.command,
+            "path": self.path,
+            "host": self.headers.get("Host", "unknown"),
+            "headers": dict(self.headers),
+            "body_length": len(body),
+            "body": body,
+        }
+
+    def _should_hijack(self, path):
+        """Return True if this path should be served by us instead of proxied."""
+        if self.server.mode != "hijack":
+            return False
+        clean = path.rstrip("/")
+        return clean in (
+            "/.well-known/device-infra-home",
+            "/.well-known/infrastructure-home",
+            "/.well-known/device-infrastructure-home",
+        ) or clean.startswith("/time")
+
+    def _proxy_to_vorwerk(self, req_data):
+        """
+        Forward the request to the real Vorwerk server and return the response.
+        The Docker container resolves DNS normally via systemd-resolved,
+        which goes out through USB Ethernet to the real internet.
+        """
+        host = req_data["host"]
+        path = req_data["path"]
+        method = req_data["method"]
+        body = req_data["body"]
+
+        log.info("PROXY → %s %s (Host: %s)", method, path, host)
+
+        try:
+            conn = http.client.HTTPConnection(host, port=80, timeout=PROXY_TIMEOUT)
+
+            # Forward all original headers except Host (already set by connection)
+            forward_headers = {}
+            for key, value in req_data["headers"].items():
+                lower = key.lower()
+                if lower not in ("host", "connection", "transfer-encoding"):
+                    forward_headers[key] = value
+
+            conn.request(method, path, body=body if body else None, headers=forward_headers)
+            resp = conn.getresponse()
+
+            resp_body = resp.read()
+            resp_headers = dict(resp.getheaders())
+
+            log.info("PROXY ← %d %s (%d bytes, Content-Type: %s)",
+                     resp.status, resp.reason, len(resp_body),
+                     resp_headers.get("Content-Type", resp_headers.get("content-type", "unknown")))
+
+            conn.close()
+
+            return {
+                "status": resp.status,
+                "reason": resp.reason,
+                "headers": resp_headers,
+                "body": resp_body,
+                "content_type": resp_headers.get("Content-Type", resp_headers.get("content-type", "")),
+            }
+
+        except Exception as e:
+            log.error("PROXY FAILED: %s %s → %s", method, host, e)
+            return {
+                "status": 502,
+                "reason": "Bad Gateway",
+                "headers": {},
+                "body": f"OpenMix proxy error: {e}".encode(),
+                "content_type": "text/plain",
+            }
+
+    def _send_response_data(self, resp_data):
+        """Send a proxied or constructed response back to the TM6."""
+        self.send_response(resp_data["status"])
+        for key, value in resp_data.get("headers", {}).items():
+            # Skip hop-by-hop headers
+            if key.lower() in ("transfer-encoding", "connection", "keep-alive"):
+                continue
+            self.send_header(key, value)
+        self.end_headers()
+        body = resp_data.get("body", b"")
+        if isinstance(body, str):
+            body = body.encode()
+        self.wfile.write(body)
+
+    def _handle_any(self):
+        """Handle any HTTP method (GET, POST, PUT, etc.)."""
         parsed = urlparse(self.path)
+        path = parsed.path
+        req_data = self._get_request_data()
+
+        log.info("← %s %s | Host: %s | UA: %s",
+                 self.command, self.path,
+                 req_data["host"],
+                 req_data["headers"].get("User-Agent", "unknown"))
+
+        # Check if we should hijack this request
+        if self._should_hijack(path):
+            resp_data = self._handle_hijacked(parsed, req_data)
+            source = "hijacked"
+        else:
+            # Proxy to real Vorwerk
+            resp_data = self._proxy_to_vorwerk(req_data)
+            source = "proxied"
+
+        # Log the full exchange to disk
+        log_req = {**req_data}
+        if isinstance(log_req.get("body"), bytes):
+            log_req["body"] = f"<{len(log_req['body'])} bytes>"
+        self.server.capture.log_exchange(log_req, resp_data, source)
+
+        # Send response to TM6
+        self._send_response_data(resp_data)
+
+    def _handle_hijacked(self, parsed, req_data):
+        """Serve our own response for hijacked endpoints."""
         path = parsed.path.rstrip("/")
 
-        # Log all requests with full detail for debugging
-        log.info(
-            "Request: %s %s | User-Agent: %s",
-            self.command,
-            self.path,
-            self.headers.get("User-Agent", "unknown"),
-        )
-
         if path == "/.well-known/device-infra-home":
-            self._handle_device_infra_home()
+            base = f"http://{SERVER_HOST}:{SERVER_PORT}" if SERVER_PORT != 80 else f"http://{SERVER_HOST}"
+            location = f"{base}/.well-known/infrastructure-home"
+            log.info("HIJACK → 307 redirect to %s", location)
+            return {
+                "status": 307,
+                "reason": "Temporary Redirect",
+                "headers": {"Location": location, "Server": self.server_version},
+                "body": b"",
+                "content_type": "",
+            }
+
         elif path in ("/.well-known/infrastructure-home",
-                      "/.well-known/device-infrastructure-home"):
-            self._handle_infrastructure_home()
+                       "/.well-known/device-infrastructure-home"):
+            body = json.dumps(get_infrastructure_home(), indent=2).encode("utf-8")
+            log.info("HIJACK → 200 infrastructure-home (%d bytes)", len(body))
+            return {
+                "status": 200,
+                "reason": "OK",
+                "headers": {
+                    "Content-Type": "application/hal+json",
+                    "Content-Length": str(len(body)),
+                    "Server": self.server_version,
+                },
+                "body": body,
+                "content_type": "application/hal+json",
+            }
+
         elif path == "/time":
-            self._handle_time(parsed)
-        else:
-            self._handle_unknown()
+            params = parse_qs(parsed.query)
+            challenge = params.get("challenge", [None])[0]
+            if not challenge:
+                return {
+                    "status": 400,
+                    "reason": "Bad Request",
+                    "headers": {},
+                    "body": b"Missing challenge parameter",
+                    "content_type": "text/plain",
+                }
 
-    def _handle_device_infra_home(self):
-        """
-        Step 4, Request 1: The TM6 first hits this endpoint.
-        Vorwerk returns a 307 redirect to the real infrastructure-home.
-        We redirect to ourselves.
-        """
-        base = f"http://{SERVER_HOST}:{SERVER_PORT}" if SERVER_PORT != 80 else f"http://{SERVER_HOST}"
-        location = f"{base}/.well-known/infrastructure-home"
+            signed_data = self.server.ca.sign_time_response(challenge)
+            if signed_data:
+                log.info("HIJACK → 200 signed time (%d bytes)", len(signed_data))
+                return {
+                    "status": 200,
+                    "reason": "OK",
+                    "headers": {
+                        "Content-Type": "application/pkcs7-mime",
+                        "Content-Length": str(len(signed_data)),
+                        "Server": self.server_version,
+                    },
+                    "body": signed_data,
+                    "content_type": "application/pkcs7-mime",
+                }
+            else:
+                now = datetime.now(timezone.utc)
+                body = json.dumps({
+                    "utc": now.isoformat(),
+                    "unix": int(now.timestamp()),
+                    "challenge": challenge,
+                }).encode("utf-8")
+                return {
+                    "status": 200,
+                    "reason": "OK",
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                        "Server": self.server_version,
+                    },
+                    "body": body,
+                    "content_type": "application/json",
+                }
 
-        self.send_response(307)
-        self.send_header("Location", location)
-        self.send_header("Server", self.server_version)
-        self.end_headers()
-        log.info("→ 307 redirect to %s", location)
+        # Shouldn't reach here
+        return {"status": 500, "headers": {}, "body": b"", "content_type": ""}
 
-    def _handle_infrastructure_home(self):
-        """
-        Step 4, Request 2: Return the HAL+JSON infrastructure config.
-        This is what tells the TM6 where to find its CA, EST, and time server.
-        """
-        body = json.dumps(get_infrastructure_home(), indent=2).encode("utf-8")
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/hal+json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Server", self.server_version)
-        self.end_headers()
-        self.wfile.write(body)
-        log.info("→ 200 infrastructure-home (%d bytes)", len(body))
-
-    def _handle_time(self, parsed):
-        """
-        Step 5: Signed time sync.
-        The TM6 sends GET /time?challenge=<base64> and expects a
-        PKCS#7 SignedData response (application/pkcs7-mime).
-        """
-        params = parse_qs(parsed.query)
-        challenge = params.get("challenge", [None])[0]
-
-        if not challenge:
-            self.send_error(400, "Missing challenge parameter")
-            return
-
-        log.info("Time challenge: %s", challenge)
-
-        ca = self.server.ca
-        signed_data = ca.sign_time_response(challenge)
-
-        if signed_data:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/pkcs7-mime")
-            self.send_header("Content-Length", str(len(signed_data)))
-            self.send_header("Server", self.server_version)
-            self.end_headers()
-            self.wfile.write(signed_data)
-            log.info("→ 200 signed time (%d bytes)", len(signed_data))
-        else:
-            # Fallback: return unsigned JSON time (for testing without cryptography)
-            now = datetime.now(timezone.utc)
-            body = json.dumps({
-                "utc": now.isoformat(),
-                "unix": int(now.timestamp()),
-                "challenge": challenge,
-            }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Server", self.server_version)
-            self.end_headers()
-            self.wfile.write(body)
-            log.info("→ 200 unsigned time fallback (%d bytes)", len(body))
-
-    def _handle_unknown(self):
-        """Log and 404 any unrecognized path — helps discover what the TM6 asks for."""
-        log.warning(
-            "UNKNOWN REQUEST: %s %s (headers: %s)",
-            self.command,
-            self.path,
-            dict(self.headers),
-        )
-        body = b"Not Found"
-        self.send_response(404)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Server", self.server_version)
-        self.end_headers()
-        self.wfile.write(body)
+    # Handle all HTTP methods
+    do_GET = _handle_any
+    do_POST = _handle_any
+    do_PUT = _handle_any
+    do_PATCH = _handle_any
+    do_DELETE = _handle_any
+    do_HEAD = _handle_any
+    do_OPTIONS = _handle_any
 
 
 class OpenMixServer(HTTPServer):
-    """HTTP server with CA state attached."""
+    """HTTP server with CA, capture logger, and mode."""
 
-    def __init__(self, server_address, handler_class, ca):
+    def __init__(self, server_address, handler_class, ca, capture, mode):
         self.ca = ca
+        self.capture = capture
+        self.mode = mode
         super().__init__(server_address, handler_class)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenMix Stage 1 Bootstrap Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=SERVER_PORT, help="HTTP port (default: 80)")
+    parser = argparse.ArgumentParser(description="OpenMix MITM Passthrough Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=SERVER_PORT, help="HTTP port")
     parser.add_argument("--ca-dir", default=CA_DIR, help="CA key/cert directory")
+    parser.add_argument("--log-dir", default=LOG_DIR, help="Capture log directory")
+    parser.add_argument("--mode", choices=["passthrough", "hijack"], default="passthrough",
+                        help="passthrough: proxy everything to Vorwerk and log. "
+                             "hijack: serve our bootstrap, proxy the rest.")
     args = parser.parse_args()
 
     ca = OpenMixCA(args.ca_dir)
+    capture = CaptureLogger(args.log_dir)
 
-    server = OpenMixServer((args.host, args.port), OpenMixHandler, ca)
-    log.info("OpenMix Stage 1 server starting on %s:%d", args.host, args.port)
-    log.info("CA directory: %s", args.ca_dir)
-    if HAS_CRYPTO:
-        log.info("PKCS#7 time signing: ENABLED")
+    server = OpenMixServer((args.host, args.port), OpenMixHandler, ca, capture, args.mode)
+
+    log.info("=" * 60)
+    log.info("OpenMix server starting")
+    log.info("  Mode: %s", args.mode)
+    log.info("  Listen: %s:%d", args.host, args.port)
+    log.info("  CA: %s", args.ca_dir)
+    log.info("  Captures: %s", args.log_dir)
+    log.info("")
+    if args.mode == "passthrough":
+        log.info("  PASSTHROUGH: all requests proxied to real Vorwerk")
+        log.info("  Every request+response logged to %s", args.log_dir)
+        log.info("  The TM6 talks to Vorwerk normally — we just record everything")
     else:
-        log.info("PKCS#7 time signing: DISABLED (install 'cryptography' package)")
-    log.info("Infrastructure-home will point EST to: https://%s:%d", EST_HOST, EST_PORT)
-    log.info("")
-    log.info("DNS domains to redirect to this server:")
-    log.info("  %s.nwot-plain.vorwerk-digital.com", LOCALE.upper())
-    log.info("  %s.plain.production-eu.cookidoo.vorwerk-digital.com", LOCALE)
-    log.info("")
+        log.info("  HIJACK: bootstrap endpoints served by us, rest proxied")
+        log.info("  Hijacked: /.well-known/device-infra-home")
+        log.info("            /.well-known/infrastructure-home")
+        log.info("            /time?challenge=...")
+        log.info("  EST target: https://%s:%d", EST_HOST, EST_PORT)
+    log.info("=" * 60)
 
     try:
         server.serve_forever()

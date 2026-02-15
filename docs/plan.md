@@ -272,50 +272,113 @@ Options:
 
 ### Phase 3: Build the OpenMix Server
 
-**Goal:** A self-contained Docker service that impersonates Vorwerk's infrastructure, step by step.
+**Goal:** Full transparent MITM between TM6 and Vorwerk, then progressively replace Vorwerk's endpoints with our own.
 
 ```
-TM6 --WiFi--> Ubuntu AP --DNS--> OpenMix Server (Docker)
-                |                    |
-                +--USB Ethernet------+---> Internet (for passthrough if needed)
+TM6 --WiFi--> Our AP (wlp7s0) --iptables--> mitmproxy --USB Ethernet--> Vorwerk
+                                                  ↓
+                                           logs everything to disk
 ```
 
-#### Stage 1: Basic Connectivity (cleartext bootstrap)
+Each stage has a **feasibility gate** — a concrete yes/no test. If a gate fails, we find another way through. No point building Stage 3 until Stage 2 passes.
 
-Serve the cleartext HTTP endpoints that the TM6 hits first. No TLS required.
+---
 
-| Endpoint | What to serve |
-|----------|--------------|
-| `GET /.well-known/device-infra-home` | 307 redirect to our own infrastructure-home |
-| `GET /.well-known/infrastructure-home` | HAL+JSON pointing EST to our CA, time to our server |
-| `GET /time?challenge={base64}` | PKCS#7 signed time response using our CA key |
-| OCSP responder | Valid OCSP responses for our CA's certificates |
+#### Stage 0: AP connectivity
 
-#### Stage 2: PKI & Authentication
+Create our own WiFi network. Connect TM6. Verify it can reach the internet through us.
 
-If Stage 1 proves the TM6 follows our redirected bootstrap:
+**What we build:** `setup-ap.sh` (hostapd + dnsmasq + NAT + iptables)
 
-- Run our own EST Registration Authority (cacerts, simpleenroll, simplereenroll)
-- Issue device client certificates from our CA
-- Stand up the TLS endpoints the device expects (mutual TLS)
-- Implement device auth flow (`login.device.production-eu...`)
+**Test:** TM6 connects to `TM6-OpenMix` WiFi, gets a DHCP lease, and can function normally (recipes load, sync works). We see DNS queries in `dnsmasq` logs.
 
-#### Stage 3: Recipe Content
+> **GATE 0: Does the TM6 connect to our AP and work normally?**
+>
+> - **PASS →** We control the network. Proceed to Stage 1.
+> - **FAIL →** TM6 refuses to connect, or connects but can't reach Vorwerk. Debug AP/NAT/DNS config. This is a setup issue, not a fundamental blocker.
 
-Once the device trusts our server and authenticates:
+---
 
-- Reverse-engineer the recipe sync API via mitmproxy
-- Build recipe storage (SQLite or filesystem)
-- Serve recipes in the TM6's expected format
-- Import recipes from Cookidoo exports (cookidump/cookidoo-api)
+#### Stage 1: HTTP passthrough + protocol capture
 
-**Fallback architecture** (if EST redirection fails):
+Spoof DNS for Vorwerk's cleartext HTTP domains only. Proxy all HTTP requests to real Vorwerk, log full request+response. HTTPS goes directly to Vorwerk via NAT (we don't touch it yet).
+
+**What we build:** `openmix-server.py --mode passthrough`
+
+**What we learn:** The complete cleartext HTTP protocol — bootstrap sequence, infrastructure-home JSON, time sync, OCSP, redirects. This runs as long as needed (days/weeks) to build confidence in the protocol.
+
+> **GATE 1: Does the TM6 complete its cleartext HTTP bootstrap through our proxy?**
+>
+> - **PASS →** We have the full HTTP protocol captured. The TM6 doesn't care that HTTP went through a proxy. Proceed to Stage 2.
+> - **FAIL →** TM6 detects the proxy (e.g. timing, missing headers, different response size). Fix the proxy to be more transparent. This is unlikely for cleartext HTTP but possible.
+
+---
+
+#### Stage 2: Bootstrap hijack — can we control the PKI?
+
+This is the **make-or-break gate** for the entire MITM approach. Switch to hijack mode: serve our own `infrastructure-home` JSON pointing EST to our CA. Everything else still proxied to real Vorwerk.
+
+**What we build:** `openmix-server.py --mode hijack`
+
+**What we test:** Does the TM6 follow our modified infrastructure-home and attempt to connect to our EST server? Two sub-questions:
+
+1. Does the TM6 accept our modified `infrastructure-home` JSON? (It might validate a signature on the bootstrap response itself.)
+2. Does the TM6 connect to our EST endpoint? (It might validate the EST server's TLS cert against a firmware-embedded root.)
+
+> **GATE 2: Does the TM6 accept our CA via the redirected EST bootstrap?**
+>
+> - **PASS →** We are the TM6's Certificate Authority. We can issue certs it trusts. Proceed to Stage 3. **This unlocks everything.**
+> - **FAIL (2a): TM6 rejects our infrastructure-home** → The bootstrap response may be signed or integrity-checked. Investigate the PKCS#7 time response format — maybe the infrastructure-home is also signed and we need to replay or forge a valid signature. Find a way through.
+> - **FAIL (2b): TM6 connects to our EST but rejects our TLS cert** → There is a firmware-embedded trust anchor for the EST RA. Next steps: firmware extraction (JTAG/UART from FCC photos), locate the embedded root cert, replace it or find another way to inject our CA.
+
+---
+
+#### Stage 3: Full MITM — transparent proxy for all traffic
+
+We are the CA. Now run mitmproxy in transparent mode with our CA for **all** traffic — HTTP and HTTPS. The TM6 operates normally (connects to "Vorwerk" which is actually us proxying to real Vorwerk), and we log everything.
+
+**What we build:** mitmproxy addon that hijacks bootstrap + transparently proxies all HTTPS
+
+**What this gives us:**
+- Every API endpoint, request, and response — including recipes, auth, config, telemetry
+- Recipe payloads captured automatically as the family uses the TM6
+- Full protocol documentation built up over weeks/months of normal use
+- A complete local archive of every recipe accessed
+
+> **GATE 3: Does the TM6 function normally through our full MITM proxy?**
+>
+> - **PASS →** Long-term operation begins. Leave it running for months. Proceed to Stage 4 when we have enough data.
+> - **FAIL →** Some HTTPS endpoints use additional pinning or mutual TLS that mitmproxy can't handle. Identify which endpoints fail and proxy those directly (bypass MITM for those specific hosts). We may still capture most traffic.
+
+---
+
+#### Stage 4: Replace Vorwerk — standalone OpenMix server
+
+With months of captured traffic, we know the full protocol. Build a standalone server that doesn't proxy to Vorwerk at all.
+
+- Serve recipes from local storage (SQLite)
+- Handle auth locally (issue our own tokens)
+- Respond to all API endpoints the TM6 expects
+- Import recipes from captures + cookidoo-api exports
+
+> **GATE 4: Does the TM6 function with zero Vorwerk connectivity?**
+>
+> - **PASS →** OpenMix is complete. The TM6 works entirely offline against our server. Vorwerk can sunset Cookidoo and it doesn't matter.
+> - **FAIL →** Some functionality requires real Vorwerk (e.g. firmware updates, subscription validation). Document what breaks and decide what to stub out.
+
+---
+
+#### Feasibility summary
 
 ```
-Custom Tool --cookidoo-api--> Cookidoo Cloud --sync--> TM6
+Gate 0: AP connectivity          → setup issue, always fixable
+Gate 1: HTTP passthrough         → very likely to pass (cleartext, no validation)
+Gate 2: EST bootstrap hijack     → THE BIG UNKNOWN — determines entire approach
+Gate 3: Full MITM works          → likely if Gate 2 passes
+Gate 4: Standalone server        → engineering effort, no unknown blockers
 ```
 
-Push recipes through Cookidoo as a relay using the existing API. This is what cookiput already does.
+**If Gate 2 fails**, we dig deeper — firmware extraction, embedded cert replacement, or other attack vectors. The goal is full device MITM, period.
 
 ---
 
@@ -340,17 +403,17 @@ pip3 install frida-tools
 
 ## Key Questions to Answer
 
-### Architecture A blockers (local Cookidoo impersonation)
+### Architecture A blockers → now tracked as feasibility gates
 
-These must be resolved before building the OpenMix server. If any answer is unfavorable, we fall back to Architecture B (cloud relay via cookidoo-api).
+All blocker questions are now embedded in the Phase 3 gate structure above. The critical unknown is **Gate 2** (EST bootstrap hijack). Everything else is either answered by PCAP analysis or becomes answerable once Gate 2 passes.
 
-| # | Question | Status | How to answer | Blocks |
-|---|----------|--------|---------------|--------|
-| A1 | **Does the TM6 accept a redirected PKI bootstrap?** The infrastructure-home JSON is served over cleartext HTTP. If we redirect DNS and serve our own EST CA, does the TM6 trust it? | **PARTIALLY ANSWERED** — PCAP confirms cleartext bootstrap exists. The EST `cacerts` endpoint itself is HTTPS, so the device may validate the EST server's TLS cert against a firmware-embedded root. **Requires hardware test.** | Redirect bootstrap DNS to local server, serve modified infrastructure-home pointing EST to our CA. Observe whether TM6 enrolls. | Everything |
-| A2 | **What API endpoints does the TM6 firmware call?** The cookidoo-api documents the Android app's API surface, but the TM6 may hit different or additional endpoints. | **PARTIALLY ANSWERED** — PCAP reveals domains: `es.device.production-eu.cookidoo.vorwerk-digital.com` (device API), `login.device.production-eu.cookidoo.vorwerk-digital.com` (auth), `es.device-usagebox.production-eu.cookidoo.vorwerk-digital.com` (telemetry), plus CDN domains for recipes/assets. Exact API paths are behind TLS. | If A1 passes → full mitmproxy capture. Cross-reference with cookidoo-api. | Server API surface |
-| A3 | **What is the exact recipe payload format the TM6 expects?** | OPEN — behind TLS, requires A1. | Capture recipe sync response via mitmproxy. | Recipe storage & serving |
-| A4 | **How does the TM6 handle auth tokens?** | **PARTIALLY ANSWERED** — TM6 uses EST client certificates (not just OAuth2). The device enrolls via `est-simpleenroll` to get a client cert. Auth likely uses mutual TLS + OAuth2. | Capture initial connection via mitmproxy (requires A1). | Auth proxy design |
-| A5 | **Does the TM6 phone home for license/subscription checks?** | OPEN — requires hardware testing. | Observe traffic with expired subscription. | Subscription handling |
+| Old blocker | Status | Where it's tracked |
+|-------------|--------|-------------------|
+| A1: Does TM6 accept redirected PKI? | **Gate 2** — the make-or-break test | Phase 3, Stage 2 |
+| A2: What API endpoints? | Answered once Gate 3 passes (full MITM) | Phase 3, Stage 3 |
+| A3: Recipe payload format? | Answered once Gate 3 passes (full MITM) | Phase 3, Stage 3 |
+| A4: Auth tokens? | Partially answered (EST client certs). Full answer from Gate 3 | Phase 3, Stage 3 |
+| A5: Subscription checks? | Answered once Gate 3 passes (full MITM) | Phase 3, Stage 4 |
 
 ### General research questions
 

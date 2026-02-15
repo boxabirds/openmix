@@ -1,5 +1,22 @@
 # OpenMix Stage 1 — Hardware Test Instructions
 
+## What this does
+
+This test creates **a separate WiFi network** on this machine that the TM6 connects to. We are not intercepting traffic on your home network — we are building our own network from scratch with its own DHCP, DNS, and HTTP server. The TM6 is manually pointed at this network via its touchscreen WiFi settings, just like connecting it to any router.
+
+Because we control the entire network (DNS, routing, HTTP), when the TM6 tries to reach Vorwerk's servers during its boot sequence, our DNS responds with our own IP address and our server handles the requests instead of Vorwerk's.
+
+```
+                    Our network (192.168.50.0/24)
+                    ┌─────────────────────────────────────────┐
+TM6 ──WiFi──> wlp7s0 (AP: "TM6-OpenMix")                    │
+                    ├── dnsmasq: DHCP + spoofed DNS           │
+                    ├── iptables: port 80 → Docker :8080      │
+                    ├── OpenMix Server (Docker)               │
+                    └── NAT ──> USB Ethernet ──> Internet     │
+                    └─────────────────────────────────────────┘
+```
+
 ## Prerequisites
 
 - OpenMix server Docker container built (`docker compose build openmix-server`)
@@ -21,7 +38,9 @@ curl -s http://localhost:8080/.well-known/infrastructure-home | python3 -m json.
 
 You should see the HAL+JSON with EST endpoints pointing to `192.168.50.1`.
 
-## Step 2: Set up the WiFi AP
+## Step 2: Create the WiFi network
+
+This creates a completely separate WiFi network on this machine. Your home network is not affected.
 
 ```bash
 sudo ./scripts/setup-ap.sh
@@ -32,15 +51,15 @@ This does everything in one go:
 1. Installs `hostapd`, `dnsmasq`, `iw`
 2. Unblocks WiFi (`rfkill unblock wifi`)
 3. Verifies the AX210 supports AP mode
-4. Assigns `192.168.50.1` to `wlp7s0`
-5. Starts an AP named **TM6-OpenMix** (password: `openmix2026`)
-6. Configures dnsmasq to hand out DHCP leases and redirect all Vorwerk bootstrap domains to `192.168.50.1`
-7. Sets up NAT so the TM6 can still reach the internet via USB Ethernet
+4. Creates a new WiFi network on `wlp7s0` with its own subnet (`192.168.50.0/24`)
+5. Starts the access point: **SSID `TM6-OpenMix`**, password `openmix2026`
+6. Runs DHCP (assigns IPs to devices that join) and DNS (spoofs Vorwerk domains to `192.168.50.1`)
+7. Sets up NAT so the TM6 can still reach the internet via USB Ethernet for non-spoofed traffic
 8. Redirects port 80 → 8080 via iptables (so the TM6's HTTP requests hit Docker)
 
-## Step 3: Connect TM6
+## Step 3: Connect TM6 to our network
 
-On the TM6, go to WiFi settings and connect to:
+On the TM6 touchscreen, go to WiFi settings and connect to our network:
 
 - **SSID:** `TM6-OpenMix`
 - **Password:** `openmix2026`

@@ -72,6 +72,18 @@ killall wpa_supplicant 2>/dev/null || true
 if command -v nmcli &>/dev/null; then
     nmcli device set "$AP_INTERFACE" managed no 2>/dev/null || true
 fi
+
+# Prevent systemd-resolved from interfering with dnsmasq on the AP interface.
+# systemd-resolved listens on 127.0.0.53:53 by default. dnsmasq with
+# bind-interfaces will bind to 192.168.50.1:53 only, so they don't conflict
+# on the port. But we also need to tell resolved not to manage DNS for wlp7s0,
+# otherwise DHCP clients could get the wrong DNS server.
+if systemctl is-active --quiet systemd-resolved; then
+    # Tell resolved to ignore the AP interface entirely
+    resolvectl dns "$AP_INTERFACE" "" 2>/dev/null || true
+    resolvectl domain "$AP_INTERFACE" "" 2>/dev/null || true
+    echo "systemd-resolved: excluded $AP_INTERFACE"
+fi
 echo "Conflicting services stopped"
 
 # --- Step 5: Configure the AP interface ---
@@ -107,9 +119,14 @@ echo "--- Step 7: Writing dnsmasq config ---"
 # These cover all locale variants — the TM6 resolves these
 # during its cleartext HTTP bootstrap.
 cat > /etc/dnsmasq.d/openmix.conf << EOF
-# OpenMix: only listen on the AP interface
-interface=$AP_INTERFACE
+# OpenMix: only listen on the AP interface IP, not 0.0.0.0.
+# This avoids conflict with systemd-resolved on 127.0.0.53:53.
+listen-address=$AP_IP
 bind-interfaces
+# Do not read /etc/resolv.conf — forward non-spoofed queries to a public DNS
+no-resolv
+server=8.8.8.8
+server=1.1.1.1
 
 # DHCP for TM6
 dhcp-range=$DHCP_RANGE_START,$DHCP_RANGE_END,$AP_SUBNET,24h

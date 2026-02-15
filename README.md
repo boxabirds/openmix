@@ -4,13 +4,28 @@ Self-hosted recipe server for the Vorwerk Thermomix TM6. A right-to-repair proje
 
 ## How it works
 
-The TM6 boots with a **cleartext HTTP bootstrap** before any TLS connections. During this phase it fetches an infrastructure configuration that tells it where to find its PKI (Certificate Authority, enrollment endpoints) and time server. Because this bootstrap happens over plain HTTP resolved via plain DNS, we can redirect the device to our own server.
+**We create our own WiFi network** that the TM6 connects to instead of your home router. This machine runs a WiFi access point (using `hostapd` on the onboard Intel AX210) with its own DHCP and DNS. Because we control the network, we control what the TM6 sees when it tries to reach Vorwerk's servers.
+
+The TM6 boots with a **cleartext HTTP bootstrap** before any TLS connections. During this phase it fetches an infrastructure configuration that tells it where to find its PKI (Certificate Authority, enrollment endpoints) and time server. Because this bootstrap happens over plain HTTP resolved via plain DNS, we can intercept it by spoofing DNS responses on our network to point Vorwerk's domains at our own server.
 
 ```
-TM6 --WiFi--> Ubuntu AP --DNS--> OpenMix Server (Docker)
-                |                    |
-                +--USB Ethernet------+---> Internet
+                    Our network (192.168.50.0/24)
+                    ┌─────────────────────────────────────────┐
+                    │                                         │
+TM6 ──WiFi──> wlp7s0 (AP: "TM6-OpenMix")                    │
+                    │                                         │
+                    ├── dnsmasq: DHCP + DNS (spoofs Vorwerk)  │
+                    │                                         │
+                    ├── iptables: port 80 → Docker :8080      │
+                    │                                         │
+                    ├── OpenMix Server (Docker)               │
+                    │                                         │
+                    └── NAT ──> enxc8a362ba2d6d ──> Internet  │
+                                (USB Ethernet)                │
+                    └─────────────────────────────────────────┘
 ```
+
+The TM6 is manually connected to our `TM6-OpenMix` WiFi (via the touchscreen) just like you'd connect it to any home router. It has no idea it's not on a normal network.
 
 ## Current status: Stage 1 (cleartext bootstrap)
 

@@ -9,7 +9,10 @@ services:
     stdin_open: true
     tty: true
 
-  # Stage 1: Cleartext HTTP bootstrap server
+  # MITM passthrough server
+  # Modes:
+  #   passthrough (default) — proxy all HTTP to real Vorwerk, log everything
+  #   hijack — serve our bootstrap responses, proxy the rest
   openmix-server:
     build: .
     container_name: openmix-server
@@ -23,5 +26,12 @@ services:
       - OPENMIX_PORT=80
       - OPENMIX_LOCALE=${OPENMIX_LOCALE:-es}
       - OPENMIX_CA_DIR=/openmix/data/ca
-    entrypoint: ["python3", "/openmix/scripts/openmix-server.py", "--port", "80"]
+      - OPENMIX_LOG_DIR=/openmix/data/captures
+    entrypoint:
+      - python3
+      - /openmix/scripts/openmix-server.py
+      - --port
+      - "80"
+      - --mode
+      - ${OPENMIX_MODE:-passthrough}
     restart: unless-stopped
