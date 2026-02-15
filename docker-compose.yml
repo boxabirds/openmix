@@ -1,0 +1,27 @@
+services:
+  openmix:
+    build: .
+    container_name: openmix
+    volumes:
+      - ./data:/openmix/data
+      - ./scripts:/openmix/scripts
+      - ./docs:/openmix/docs
+    stdin_open: true
+    tty: true
+
+  # Stage 1: Cleartext HTTP bootstrap server
+  openmix-server:
+    build: .
+    container_name: openmix-server
+    volumes:
+      - ./data:/openmix/data
+      - ./scripts:/openmix/scripts
+    ports:
+      - "8080:80"
+    environment:
+      - OPENMIX_HOST=${OPENMIX_HOST:-192.168.50.1}
+      - OPENMIX_PORT=80
+      - OPENMIX_LOCALE=${OPENMIX_LOCALE:-es}
+      - OPENMIX_CA_DIR=/openmix/data/ca
+    entrypoint: ["python3", "/openmix/scripts/openmix-server.py", "--port", "80"]
+    restart: unless-stopped

@@ -6,6 +6,49 @@ Right-to-repair project: build a self-hosted recipe server for TM6 before Vorwer
 
 ---
 
+## This Machine
+
+| Component | Detail |
+|-----------|--------|
+| CPU | Intel i9-13900F — 24 cores / 32 threads, up to 5.6 GHz |
+| RAM | 64 GB DDR |
+| Disk | 1.4 TB NVMe, ~207 GB free |
+| OS | Ubuntu 22.04.5 LTS, kernel 6.8.0-94-generic |
+| Primary internet | `enxc8a362ba2d6d` — ASIX AX88179 USB 3.0 Gigabit Ethernet (DHCP, 192.168.4.x) |
+| Onboard Ethernet | `eno1` (Realtek RTL8125 2.5GbE) — DOWN, no cable connected |
+| WiFi | `wlp7s0` — Intel AX210 (WiFi 6E, 2.4/5/6 GHz), driver: iwlwifi. Currently **soft-blocked** (`rfkill`) |
+| Tailscale | Active on `tailscale0` |
+| Docker | Running (docker_gwbridge UP) |
+
+### Network interface mapping
+
+The plan below references generic names. Here's what they map to on this machine:
+
+| Plan reference | Actual interface | Notes |
+|---------------|-----------------|-------|
+| `eth0` (internet uplink) | `enxc8a362ba2d6d` | USB Ethernet — the active internet connection |
+| `wlan1` (AP for TM6) | `wlp7s0` | Intel AX210 — must `rfkill unblock wifi` first |
+
+### No USB WiFi adapter needed
+
+The Intel AX210 supports AP mode and the machine already has a separate wired internet uplink via USB Ethernet. The two-NIC requirement (one for internet, one for AP) is already satisfied:
+
+```
+Internet <--USB Ethernet--> enxc8a362ba2d6d <--NAT--> wlp7s0 (AP) <--WiFi--> TM6
+```
+
+### Pre-installed vs. needed software
+
+| Tool | Status |
+|------|--------|
+| dnsmasq | Installed (base package only — `dnsmasq-base`) |
+| tshark / wireshark | **Not installed** |
+| mitmproxy / mitmdump | **Not installed** |
+| hostapd | **Not installed** |
+| frida-tools | **Not installed** |
+
+---
+
 ## Current State of Knowledge
 
 ### What the community has cracked
@@ -19,7 +62,20 @@ All existing work operates at the **Cookidoo cloud API level** — nobody has re
 | cookidump | Bulk export recipes as JSON | https://github.com/auino/cookidump |
 | cookidoo-scraper | REST API over Cookidoo website via Puppeteer | https://github.com/tobim-dev/cookidoo-scraper |
 | mcp-cookidoo | MCP server wrapping cookidoo-api | https://github.com/alexandrepa/mcp-cookidoo |
-| Monsieur-Cuisine-Connect-Hack | Full root of Lidl's Thermomix clone — serial protocol docs for motor/heat/scale | https://github.com/EliasKotlyar/Monsieur-Cuisine-Connect-Hack |
+| Monsieur-Cuisine-Connect-Hack | Full root of Lidl's Thermomix clone — serial protocol docs for motor/heat/scale. **Full analysis: [docs/mcc-hack-analysis.md](mcc-hack-analysis.md)** | https://github.com/EliasKotlyar/Monsieur-Cuisine-Connect-Hack |
+
+### Monsieur Cuisine Connect - key takeaways for TM6
+
+Detailed analysis in `docs/mcc-hack-analysis.md`. The MCC is the closest architectural analog to the TM6 that has been fully reverse-engineered. Key facts:
+
+- **SoC**: MediaTek MT6580 (quad-core Cortex-A7), Android 6.0, 1 GB RAM, 16 GB eMMC
+- **Two-chip architecture**: Android tablet SoC talks to a dedicated MCU via serial UART (`/dev/ttyMT0`). The MCU controls motor, heater, scale, thermometer. **The TM6 almost certainly uses the same two-chip pattern.**
+- **Serial protocol**: 15-byte fixed-length frames. Header `0x55 0x0F 0xA1`, footer `0xAA`, additive checksum. Commands: motor speed (0-10), temperature level (0-19), motor direction, scale tare/calibration, sleep mode.
+- **Root method**: Physical USB debug port under maintenance cover + MediaTek SP Flash Tool. No software exploit needed.
+- **Factory test app** (`EnduranceTest`): This was the Rosetta Stone for the serial protocol. The TM6 firmware will have an equivalent test mode.
+- **Cloud server**: `mc20.monsieur-cuisine.com`, IP-restricted to Europe. Update manifest at `/666a60bc-0ce2-4878-9e3b-23ba3ceaba5a/versions.txt`.
+- **Recipe storage**: SQLite database on device. Newer MC3 model encrypts with SQLCipher (key = MD5 of last 29 chars of SHA-1 APK signature).
+- **No custom server built**: Despite full root + documented serial protocol, the community has NOT built a replacement recipe server or local control app. The gap is in software, not in knowledge.
 
 ### What's known about TM6 networking
 
@@ -47,12 +103,50 @@ Times in seconds. Locale is `de-DE`, `en-US`, etc.
 - Likely quad-core ARM SoC, Linux-based
 - Synacktiv published TM5 exploit research (Jan 2026) but explicitly did NOT evaluate TM6/TM7: https://www.synacktiv.com/en/publications/let-me-cook-you-a-vulnerability-exploiting-the-thermomix-tm5
 
-### Unknown / uncracked
+### PCAP Analysis Findings (VARIOT normal2 dataset)
 
-- TM6 TLS certificate pinning behavior
+Full details in [docs/pcap-findings.md](pcap-findings.md). Key discoveries:
+
+**The TM6 boot sequence is partially cleartext:**
+
+| Step | Protocol | What happens |
+|------|----------|-------------|
+| 1 | DHCP (cleartext) | Standard DHCP, hostname `thermomix-{last6ofMAC}` |
+| 2 | SSDP (cleartext) | UPnP M-SEARCH to `239.255.255.250:1900` every ~20s |
+| 3 | DNS (plaintext UDP 53) | **No DNS-over-HTTPS** — DNS spoofing is viable |
+| 4 | HTTP (cleartext port 80) | **Infrastructure bootstrap** — fetches `/.well-known/device-infra-home` → 307 → `/.well-known/infrastructure-home` (HAL+JSON with EST endpoints) |
+| 5 | HTTP (cleartext port 80) | **Signed time sync** — GET `/time?challenge={base64}` → PKCS#7 signed response |
+| 6 | HTTP (cleartext port 80) | **OCSP checks** — certificate revocation checks to Vorwerk's own OCSP responders |
+| 7 | HTTP → HTTPS redirect | Device config fetch (content-addressable hash) |
+| 8 | TLS 1.3 (port 443) | All remaining traffic: API, auth, recipes, telemetry |
+
+**EST (RFC 7030) PKI bootstrap:**
+
+The infrastructure-home JSON (served over cleartext HTTP!) points the device to its PKI:
+- `est-cacerts` — download trusted CA certificates
+- `est-simpleenroll` — get a device client certificate
+- `est-simplereenroll` — renew the client certificate
+- Registration Authority: `tm6-ra.production-eu.cookidoo.vorwerk-digital.com`
+
+**Vorwerk private PKI:**
+- Own CA with custom OCSP responders (`server-ca.ocsp.tm-prod.vorwerk-digital.com`, `server-region-ca.ocsp.tm-prod.vorwerk-digital.com`)
+- OCSP checks are over cleartext HTTP
+
+**The attack surface:**
+
+Since the infrastructure-home URL is served over plaintext HTTP and resolved via plaintext DNS, we can:
+1. Redirect DNS to our server
+2. Serve a modified `infrastructure-home` pointing EST to our own CA
+3. If the TM6 accepts our CA → we control all TLS trust → full API interception
+
+**The open question:** Does the TM6 validate the EST server's TLS certificate against a firmware-embedded trust anchor, or does it follow whatever the cleartext infrastructure-home JSON tells it? This requires testing with actual hardware.
+
+### Remaining unknowns
+
+- Does the TM6 validate EST server certs against a firmware-embedded root? (requires hardware test)
 - On-device protocol for guided cooking commands (temp, speed, time)
 - Firmware extraction or modification on TM6
-- Whether any unencrypted channels exist
+- Exact recipe payload format at the device level
 
 ---
 
@@ -101,25 +195,25 @@ Download from https://fccid.io/2AGELTM65/Internal-Photos/Internal-photographs-44
 #### Prerequisites
 
 ```bash
-# Install mitmproxy
-sudo apt install python3-pip
+# Unblock the WiFi adapter (currently rfkill soft-blocked)
+sudo rfkill unblock wifi
+
+# Install missing tools
+sudo apt install tshark wireshark hostapd iptables-persistent
 pip3 install mitmproxy
 
-# Install hostapd + dnsmasq for WiFi AP
-sudo apt install hostapd dnsmasq
-
-# Need a USB WiFi adapter that supports AP mode (e.g. Alfa AWUS036ACM)
-# The machine's built-in NIC stays on the LAN for internet
+# dnsmasq-base is already installed; install the full service wrapper
+sudo apt install dnsmasq
 ```
 
 #### Set up WiFi AP
 
 ```bash
 # /etc/hostapd/hostapd.conf
-interface=wlan1          # USB WiFi adapter
+interface=wlp7s0         # Intel AX210 (onboard)
 driver=nl80211
 ssid=TM6-Research
-hw_mode=g
+hw_mode=g                # 2.4 GHz — best compatibility with TM6
 channel=6
 wpa=2
 wpa_passphrase=<password>
@@ -128,9 +222,15 @@ rsn_pairwise=CCMP
 ```
 
 ```bash
-# /etc/dnsmasq.conf (for the AP interface only)
-interface=wlan1
+# /etc/dnsmasq.d/tm6-ap.conf (drop-in, keeps system dnsmasq config intact)
+interface=wlp7s0
+bind-interfaces
 dhcp-range=192.168.50.10,192.168.50.100,255.255.255.0,24h
+```
+
+```bash
+# Assign static IP to AP interface
+sudo ip addr add 192.168.50.1/24 dev wlp7s0
 ```
 
 #### Enable NAT + transparent proxy redirect
@@ -139,13 +239,13 @@ dhcp-range=192.168.50.10,192.168.50.100,255.255.255.0,24h
 # Enable IP forwarding
 echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
 
-# NAT for internet access
-sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+# NAT — route AP traffic out through the USB Ethernet uplink
+sudo iptables -t nat -A POSTROUTING -o enxc8a362ba2d6d -j MASQUERADE
 
 # Redirect HTTPS through mitmproxy (transparent mode)
 MITMPROXY_PORT=8080
-sudo iptables -t nat -A PREROUTING -i wlan1 -p tcp --dport 443 -j REDIRECT --to-port $MITMPROXY_PORT
-sudo iptables -t nat -A PREROUTING -i wlan1 -p tcp --dport 80 -j REDIRECT --to-port $MITMPROXY_PORT
+sudo iptables -t nat -A PREROUTING -i wlp7s0 -p tcp --dport 443 -j REDIRECT --to-port $MITMPROXY_PORT
+sudo iptables -t nat -A PREROUTING -i wlp7s0 -p tcp --dport 80 -j REDIRECT --to-port $MITMPROXY_PORT
 ```
 
 #### Run mitmproxy in transparent mode
@@ -170,31 +270,52 @@ Options:
 
 ---
 
-### Phase 3: Build the Recipe Server
+### Phase 3: Build the OpenMix Server
 
-**Goal:** A local proxy that the TM6 thinks is Cookidoo.
-
-Architecture (depends on Phase 2 findings):
+**Goal:** A self-contained Docker service that impersonates Vorwerk's infrastructure, step by step.
 
 ```
-TM6 --WiFi--> Ubuntu AP --DNS override--> Local Recipe Server
-                                |
-                                +--> Real Cookidoo (for auth, passthrough)
+TM6 --WiFi--> Ubuntu AP --DNS--> OpenMix Server (Docker)
+                |                    |
+                +--USB Ethernet------+---> Internet (for passthrough if needed)
 ```
 
-- DNS spoofing: resolve cookidoo.*.com to local IP
-- Local server mimics Cookidoo's API surface
-- Serves custom recipes in the format TM6 expects
-- Proxies auth and subscription checks to real Cookidoo
-- Caches/stores recipes locally for when Vorwerk pulls the plug
+#### Stage 1: Basic Connectivity (cleartext bootstrap)
 
-**Fallback architecture** (if on-device protocol is too locked down):
+Serve the cleartext HTTP endpoints that the TM6 hits first. No TLS required.
+
+| Endpoint | What to serve |
+|----------|--------------|
+| `GET /.well-known/device-infra-home` | 307 redirect to our own infrastructure-home |
+| `GET /.well-known/infrastructure-home` | HAL+JSON pointing EST to our CA, time to our server |
+| `GET /time?challenge={base64}` | PKCS#7 signed time response using our CA key |
+| OCSP responder | Valid OCSP responses for our CA's certificates |
+
+#### Stage 2: PKI & Authentication
+
+If Stage 1 proves the TM6 follows our redirected bootstrap:
+
+- Run our own EST Registration Authority (cacerts, simpleenroll, simplereenroll)
+- Issue device client certificates from our CA
+- Stand up the TLS endpoints the device expects (mutual TLS)
+- Implement device auth flow (`login.device.production-eu...`)
+
+#### Stage 3: Recipe Content
+
+Once the device trusts our server and authenticates:
+
+- Reverse-engineer the recipe sync API via mitmproxy
+- Build recipe storage (SQLite or filesystem)
+- Serve recipes in the TM6's expected format
+- Import recipes from Cookidoo exports (cookidump/cookidoo-api)
+
+**Fallback architecture** (if EST redirection fails):
 
 ```
 Custom Tool --cookidoo-api--> Cookidoo Cloud --sync--> TM6
 ```
 
-Less interesting but functional: push recipes through Cookidoo as a relay using the existing API. This is what cookiput already does.
+Push recipes through Cookidoo as a relay using the existing API. This is what cookiput already does.
 
 ---
 
@@ -202,13 +323,13 @@ Less interesting but functional: push recipes through Cookidoo as a relay using 
 
 ### Hardware needed
 
-- USB WiFi adapter with AP mode support (e.g. Alfa AWUS036ACM, ~$35)
-  - Check the Ubuntu machine — if it has two NICs (eth + wlan) you might not need this
+- ~~USB WiFi adapter~~ — **not needed**, Intel AX210 onboard + USB Ethernet already provides two NICs
 - Optional: old Android phone for app traffic interception + Frida
 
-### Software (Ubuntu 22.04)
+### Software to install
 
 ```bash
+# All that's missing (dnsmasq-base already present)
 sudo apt install tshark wireshark hostapd dnsmasq iptables-persistent
 pip3 install mitmproxy
 # Frida (if doing Android interception)
@@ -219,12 +340,25 @@ pip3 install frida-tools
 
 ## Key Questions to Answer
 
-1. Do the VARIOT PCAPs reveal any cleartext traffic or non-standard ports?
-2. Does the TM6 use DNS-over-HTTPS or plain DNS? (if plain, we get domain intel even with TLS pinning)
-3. What exact SoC is in the TM6? (FCC photos)
-4. Does the TM6 verify server certificates (pinning) or just use standard CA validation?
-5. What does the guided cooking recipe format look like at the device level vs the API level?
-6. Is there a UART/JTAG header on the TM6 PCB? (FCC photos)
+### Architecture A blockers (local Cookidoo impersonation)
+
+These must be resolved before building the OpenMix server. If any answer is unfavorable, we fall back to Architecture B (cloud relay via cookidoo-api).
+
+| # | Question | Status | How to answer | Blocks |
+|---|----------|--------|---------------|--------|
+| A1 | **Does the TM6 accept a redirected PKI bootstrap?** The infrastructure-home JSON is served over cleartext HTTP. If we redirect DNS and serve our own EST CA, does the TM6 trust it? | **PARTIALLY ANSWERED** — PCAP confirms cleartext bootstrap exists. The EST `cacerts` endpoint itself is HTTPS, so the device may validate the EST server's TLS cert against a firmware-embedded root. **Requires hardware test.** | Redirect bootstrap DNS to local server, serve modified infrastructure-home pointing EST to our CA. Observe whether TM6 enrolls. | Everything |
+| A2 | **What API endpoints does the TM6 firmware call?** The cookidoo-api documents the Android app's API surface, but the TM6 may hit different or additional endpoints. | **PARTIALLY ANSWERED** — PCAP reveals domains: `es.device.production-eu.cookidoo.vorwerk-digital.com` (device API), `login.device.production-eu.cookidoo.vorwerk-digital.com` (auth), `es.device-usagebox.production-eu.cookidoo.vorwerk-digital.com` (telemetry), plus CDN domains for recipes/assets. Exact API paths are behind TLS. | If A1 passes → full mitmproxy capture. Cross-reference with cookidoo-api. | Server API surface |
+| A3 | **What is the exact recipe payload format the TM6 expects?** | OPEN — behind TLS, requires A1. | Capture recipe sync response via mitmproxy. | Recipe storage & serving |
+| A4 | **How does the TM6 handle auth tokens?** | **PARTIALLY ANSWERED** — TM6 uses EST client certificates (not just OAuth2). The device enrolls via `est-simpleenroll` to get a client cert. Auth likely uses mutual TLS + OAuth2. | Capture initial connection via mitmproxy (requires A1). | Auth proxy design |
+| A5 | **Does the TM6 phone home for license/subscription checks?** | OPEN — requires hardware testing. | Observe traffic with expired subscription. | Subscription handling |
+
+### General research questions
+
+1. ~~Do the VARIOT PCAPs reveal any cleartext traffic or non-standard ports?~~ **ANSWERED: YES** — cleartext HTTP bootstrap, time sync, OCSP. See PCAP findings.
+2. ~~Does the TM6 use DNS-over-HTTPS or plain DNS?~~ **ANSWERED: Plain DNS** (UDP port 53). DNS spoofing confirmed viable.
+3. What exact SoC is in the TM6? (FCC photos) — OPEN
+4. What does the guided cooking recipe format look like at the device level vs the API level? — OPEN
+5. Is there a UART/JTAG header on the TM6 PCB? (FCC photos) — OPEN
 
 ---
 

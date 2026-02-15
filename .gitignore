@@ -1,0 +1,9 @@
+# Data directory — PCAPs, CA keys, test logs
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
